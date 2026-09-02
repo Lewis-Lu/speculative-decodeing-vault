@@ -1,0 +1,863 @@
+                                                         P-EAGLE: Parallel-Drafting EAGLE with Scalable Training
+
+
+                                                   Mude Hui * 1 2 Xin Huang * 3 Jaime Campos Salas 3 Yue Sun 3 Nathan Pemberton 3 Xiang Song 3
+                                                                                 Ashish Khetan 3 George Karypis 3
+
+
+                                                                   Abstract                                 target model, leveraging contextual representations that stan-
+                                                Reasoning LLMs produce longer outputs, requir-              dalone drafters must learn independently through multiple
+                                                ing speculative decoding drafters trained on ex-            transformer layers. This enables a compact single-layer ar-
+                                                                                                            chitecture comprising only 2–5% of target model parameters.
+arXiv:2602.01469v1 [cs.LG] 1 Feb 2026
+
+
+
+
+                                                tended sequences. Parallel drafting—predicting
+                                                multiple tokens per forward pass—offers latency             However, EAGLE generates draft tokens autoregressively:
+                                                benefits over sequential generation, but training           producing K tokens requires K sequential forward passes,
+                                                complexity scales quadratically with the product            creating significant drafting overhead.
+                                                of sequence length and parallel positions, render-          Parallel drafting presents a promising approach to eliminate
+                                                ing long-context training impractical. We present           the overhead of autoregressive decoding. Multiple prior
+                                                P(arallel)-EAGLE, which transforms EAGLE                    works have explored parallel drafting strategies for specu-
+                                                from autoregressive to parallel multi-token predic-         lative decoding (Gloeckle et al., 2024; Xiao et al., 2024b;
+                                                tion via a learnable shared hidden state. To scale          Cai et al., 2024; Monea et al., 2023; Lin et al., 2025). Paral-
+                                                training to long contexts, we develop a framework           lelSpec (Xiao et al., 2024b) proposed parallel drafting with
+                                                featuring attention mask pre-computation and se-            a single transformer layer, but omits critical implementa-
+                                                quence partitioning techniques, enabling gradi-             tion details—notably whether and how target model hidden
+                                                ent accumulation within individual sequences for            states are utilized—and does not address the memory scal-
+                                                parallel-prediction training. We implement P-               ing challenges that arise from extended training sequences
+                                                EAGLE in vLLM and demonstrate speedups of                   with multiple parallel prediction positions. PARD (An et al.,
+                                                1.10×–1.36× over autoregressive EAGLE-3 across              2025) addresses this complexity through Conditional Drop-
+                                                GPT-OSS 120B, 20B, and Qwen3-Coder 30B.                     token (COD) training, which retains progressively fewer
+                                                                                                            sequence positions at later parallel-prediction depths to re-
+                                                                                                            duce effective sequence length. However, both methods face
+                                        1. Introduction                                                     scalability challenges when training on long sequences.
+                                        Autoregressive decoding in large language models (LLMs)             The scalability limitations of existing parallel drafting meth-
+                                        presents a fundamental efficiency challenge: each token             ods become consequential in modern inference workloads.
+                                        requires a complete forward pass through billions of pa-            Reasoning-capable models produce substantially longer out-
+                                        rameters, rendering inference memory-bandwidth bound.               puts: for example, on UltraChat dataset (Ding et al., 2023),
+                                        Speculative decoding (Chen et al., 2023) addresses this limi-       GPT-OSS 120B (OpenAI, 2025) exhibits median sequence
+                                        tation by having a lightweight draft model propose multiple         lengths of 3,891 tokens, with P90 reaching 10,800 (Fig-
+                                        candidates autoregressively, which are then verified by the         ure 1). Draft models trained on shorter sequences encounter
+                                        target model in a single forward pass.                              a distribution mismatch when deployed on such workloads,
+                                        Among various approaches in speculative decoding, EA-               exhibiting up to 25% reduction in acceptance rate on the
+                                        GLE (Li et al., 2024; 2025) has achieved widespread                 extended reasoning traces (Table 1). Effective parallel draft-
+                                        adoption in production inference systems, including                 ing therefore requires scalability to long training contexts
+                                        vLLM (Kwon et al., 2023), SGLang (Zheng et al., 2024),              that match inference distributions. Unlike standard training
+                                        and TensorRT-LLM (NVIDIA, 2023–2025), delivering 2–                 where gradient accumulation operates across examples, par-
+                                        3× speedups over standard autoregressive decoding. EA-              allel multi-token prediction amplifies memory pressure—the
+                                        GLE conditions token predictions on hidden states from the          effective sequence length grows linearly with the number of
+                                                                                                            parallel prediction positions, posing optimization challenges
+                                            *
+                                           Equal contribution 1 University of California, Santa Cruz        absent from autoregressive training.
+                                        2
+                                         Work done during an internship at AWS. 3 AWS Amazon. Corre-
+                                        spondence to: Xin Huang <xinxh@amazon.com>.                         To quantify this scalability gap, we compare Parallel-
+                                                                                                            Spec (Xiao et al., 2024b) and PARD (An et al., 2025) with
+                                        Preprint. February 3, 2026.
+
+                                                                                                        1
+                                                                          P-EAGLE: Parallel-Drafting EAGLE with Scalable Training
+
+                                                                                                   4K cutoff
+                                1,400
+                                                                                                   8K cutoff                                              Step 1: Target Model (Frozen)
+                                                                                                   Prompt + Generation
+                                                                                                                                             Prompt             Target Model              New Token
+                                1,200                                                                                                        Tokens               (N layers)
+Frequency (number of samples)
+
+
+
+
+                                1,000                                                                                                         Hidden                    (h_prompt, h_context)
+                                                                                                                                              States
+                                 800
+                                                                                                                                                                Step 2: P-EAGLE Drafter
+                                 600
+                                                                                                                                                                   Input Construction
+                                 400                                                                                                         Prompts     Pos 1           Pos 2            Pos 3         Pos 4
+                                                                                                                                               [2:]      (NTP)           (MTP)            (MTP)         (MTP)
+                                 200
+                                                                                                                                   Token     emb(p)     emb(new)       emb(mask)        emb(mask)     emb(mask)
+                                   0
+                                                                                                                                    Emb
+                                        0        10,000          20,000               30,000               40,000
+                                                          Sequence Length (tokens)                                                 Hidden
+                                                                                                                                    States   h_prompt   h_context     h_shared      h_shared          h_shared
+   Figure 1. Sequence length (prompt + generation) distribution on                                                            (fc: 3d 1d)
+                                                                                                                                                               Concatenate: [emb ; h]
+   UltraChat dataset with GPT-OSS 120B. Reasoning level: Medium.                                                                                           Combined Input (2d per position)
+   Median: 3,891 tokens; P90: 10,800 tokens; P99: 20,000 tokens.
+                                                                                                                                                                  Multi-Head Attention
+                                                                                                                                                                                                                  xN
+                                                                                               1                                                                      Feed-Forward
+     our method under identical training conditions . The results
+     are shown in Table 1. ParallelSpec encounters extremely                                                                                                      lm_head (from Target)
+     low acceptance length at 1K and 4K training contexts, and
+     out-of-memory failures at 8K+ due to quadratic attention                                                                                              t1              t2               t3           t4
+     scaling. PARD’s per-batch mask construction becomes com-                                                                                  NTP      From Target        Learnable h_shared         Output
+     putationally prohibitive beyond 4K contexts (see Section 3).
+     Our method scales to 20K tokens while maintaining compet-                                                               Figure 2. P-EAGLE architecture. The target model (top) processes
+     itive acceptance length. For hyperparameters and hardware,                                                              prompt tokens and produces hidden states from layer indexes 2,
+     see Appendix A                                                                                                          L/2, and L − 1 (concatenated to 3d dimensions), where L is the
+                                                                                                                             number of decoder layers. The P-EAGLE drafter (bottom) takes
+ Table 1. Acceptance length (AL) comparison on the MT-Bench                                                                  these hidden states for the Next-Token Prediction (NTP) position
+ dataset. Target model: GPT-OSS 120B. Speculation length: 5.                                                                 (Pos 1), which operates like standard autoregressive prediction with
+ “Infeas.” denotes computational infeasibility with 10+h per epoch.                                                          actual context. Multi-Token Prediction (MTP) positions (Pos 2-4)
+                                                                                                                             use a learnable shared hidden state hshared since they lack preceding
+                                                                                Training context length                      hidden states. Token embeddings are combined with projected
+                                 Method                   Layers                                                             hidden states and processed through N transformer layers.
+                                                                          1K        4K        8K      20K
+                                 ParallelSpec + EAGLE 3      1            1.5       1.6        OOM         OOM
+                                 PARD + EAGLE 3              4            2.4     Infeas.      OOM         OOM
+                                 Ours (P-EAGLE)              4            2.4       2.8         2.9         3.0                    that enables EAGLE to generate multiple draft tokens
+                                                                                                                                   in a single forward pass. Theoretical analysis shows at-
+                                                                                                                                   tention alone encodes sufficient positional information,
+   We present P(arallel-drafting) EAGLE, which transforms
+                                                                                                                                   eliminating the need for position-specific hidden states.
+   EAGLE from autoregressive generation to parallel multi-
+                                                                                                                                   Ablations demonstrate this simple design outperforms
+   token prediction with scalable training. Our contributions
+                                                                                                                                   four position-aware alternatives by 7–15%.
+   are as follows.
+                                                                                                                               3. Optimzed training recipe (Section 4): Through sys-
+                                1. Scalable training framework for long contexts (Sec-                                            tematic ablations, we establish P-EAGLE training best
+                                   tion 3): We develop amortized mask construction and                                            practices including architecture depth, train-inference
+                                   sequence partitioning to address a unique challenge in                                         prediction depth alignment, and embedding strategies.
+                                   parallel-prediction training: attention memory scales
+                                   quadratically with the product of sequence length and                                       4. Production deployment (Section 5): We implement
+                                   prediction depth. Our sequence partitioning technique                                          P-EAGLE in vLLM. Through comprehensive bench-
+                                   splits a single sequence into segments for gradient ac-                                        marking, P-EAGLE demonstrates consistent speedups
+                                   cumulation while preserving attention dependencies.                                            of 1.10×–1.36× over autoregressive EAGLE-3 across
+                                                                                                                                  GPT-OSS 120B, 20B (OpenAI, 2025) and Qwen3-
+                                2. EAGLE-based parallel drafting architecture (Sec-                                               Coder 30B (Team, 2025).
+                                   tion 2): We introduce a learnable shared hidden state
+         1
+           ParallelSpec does not release code or sufficient training de-                                                     2. Architecture
+     tails; we implemented their method following the paper. PARD
+     supports only standalone drafters; we adapted it to EAGLE’s train-                                                      We present the P-EAGLE architecture in Figure 2. The
+     ing framework.                                                                                                          drafter follows the LLaMA 3 architecture with rotary posi-
+
+                                                                                                                         2
+                                  P-EAGLE: Parallel-Drafting EAGLE with Scalable Training
+                                                                                                Pre-computed mask (seq_len = 4)                                               Sliced mask (seq_len = 3)
+tional embeddings (RoPE) (Su et al., 2024).                                                 Q        G0             G1       G2                                           Q     G0             G1         G2
+                                                                                       K                                                                             K
+
+Background. We first overview autoregressive EAGLE
+                                                                                       G0                                          per-block slice                   G0
+using Figure 2 as reference. To predict token t1 , the hid-                                                                       (constant time)
+
+
+
+
+                                                                       Key positions
+
+
+
+
+                                                                                                                                                     Key positions
+den state from the target model is concatenated with the
+token embedding, processed through transformer layers to                               G1                                                                            G1
+
+produce a hidden vector, and passed through the LM head.
+This corresponds to the Next-Token Prediction (NTP) posi-                              G2                                                                            G2
+tion (Pos 1) in the figure. To generate token t2 , the drafter
+                                                                                                          Query positions                                                            Query positions
+takes the predicted token t1 and the hidden vector used to
+predict t1 (before passing through the LM head) as input               Figure 3. Position-invariance of causal attention across prediction
+for the next forward pass. Similarly, generating t3 uses the           depths. G0, G1, G2 in the figure denote prediction depths 0, 1, 2,
+                                                                       where depth d predicts the token d + 1 positions ahead. The mask
+predicted token t2 and the hidden vector used to predict
+                                                                       for a shorter sequence (right) is exactly the top-left submatrix of a
+t2 . Producing K draft tokens thus requires K sequential               longer sequence’s mask (left), enabling constant-time retrieval.
+forward passes.
+Challenge for parallel drafting. Generating K tokens in
+parallel eliminates sequential forward passes but introduces
+a new problem: positions predicting t2 , t3 , . . . (which we
+call MTP positions) lack the predicted tokens and hidden               training example, PARD must construct a custom attention
+vectors from previous steps. P-EAGLE addresses this with               mask per example. This mask enforces causal constraints
+two learnable parameters: a shared hidden state hshared that           across prediction depths: positions at depth d can only at-
+substitutes for the missing hidden vectors, and a mask to-             tend to positions from earlier depths, not to depths d + 1 or
+ken embedding that substitutes for the unknown previous                beyond (which do not exist at inference time). Constructing
+tokens. This enables all K tokens to be generated in a sin-            these masks requires O((nK)2 ) operations per example,
+gle forward pass. We compare four alternative hidden state             becoming prohibitively expensive when training on long
+designs in Section 4.1, finding this simple shared approach            sequences (Table 1).
+outperforms position-aware variants by 7–15%.                          We address this bottleneck with two techniques: amortized
+Additional design choices. P-EAGLE unfreezes the token                 mask construction (Section 3.1) and sequence partition-
+embeddings inherited from the target model, as the mask to-            ing (Section 3.2).
+ken embedding must be learned to encode meaningful input
+for MTP positions (Section 4.3). We also use a deeper archi-           3.1. Amortized Mask Construction
+tecture, with four layers achieving 46% higher acceptance
+                                                                       The key insight enabling our approach is that the causal
+length than one layer (Section 4.2).
+                                                                       structure across prediction depths is position-invariant: the
+                                                                       attention pattern for positions 0 through n is identical re-
+3. Scalable Training Framework for Long                                gardless of total sequence length. This means a mask
+   Contexts                                                            for any sequence can be obtained by extracting the top-
+                                                                       left (n × K) × (n × K) submatrix from a pre-computed
+Training a parallel token prediction model requires extend-            maximum-length mask, as illustrated in Figure 3.
+ing each sequence of length n to accommodate K parallel
+prediction depths, where depth k predicts the token k + 1              We exploit this property by constructing the attention mask
+positions ahead. Without optimization, this creates n×K to-            once at training initialization for the maximum sequence
+tal positions with O((nK)2 ) attention complexity, causing             length. During training, per-example masks are obtained via
+out-of-memory failures at long sequences.                              tensor slicing—a constant-time view operation requiring no
+                                                                       additional memory allocation. The one-time initialization
+PARD (An et al., 2025) addresses this with Conditional                 cost is amortized across millions of training steps, with a
+Drop-token (COD) sampling, which reduces the number                    fixed memory footprint independent of dataset size.
+of positions at each prediction depth (also referred to as
+“groups” in PARD). Specifically, COD applies geometric de-             The practical impact is substantial. Table 2 shows that at
+cay: depth 0 retains all n positions, depth 1 randomly retains         2048-token sequences, PARD’s per-example mask construc-
+n × r positions, depth 2 retains n × r2 , and so on, where             tion causes 48× data loading slowdown and 5× epoch time
+r ∈ (0, 1) is the retention rate. The total positions across all       increase. Our pre-computed approach eliminates this bottle-
+depths becomes n × (1 + r + r2 + · · · + rK−1 ) rather than            neck entirely.
+n × K, significantly reducing attention memory. However,                 2
+                                                                           EAGLE-3 uses Training-Time Test (Li et al., 2025), requiring
+because COD samples different positions randomly for each              multiple forward passes per example.
+
+                                                                   3
+                                  P-EAGLE: Parallel-Drafting EAGLE with Scalable Training
+
+Table 2. Training overhead (2048 tokens, K = 8). Data loading           Step 1: Original Sequence (16 positions)
+measured on 128 examples. Epoch measured on UltraChat (200K               0    1    2    3    4       5       6       7     8   9   10 11 12 13 14 15
+examples), 8×H200 GPUs.                                                             Part 0 (positions 0-7)                      Part 1 (positions 8-15)
+                                                                        Step 2: Groups After COD Sampling (showing sampled positions per group)
+          Method        Load (128 ex.)      Epoch
+                                                                         Group 0
+                                                                                   0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+          EAGLE-32          14.8s           2.5h                         (100%)
+          PARD           718.5s (48×)     12+h (5×)                      Group 1
+                                                                                 1      3    4    6       7       9       10 12 14 15
+          Ours              17.5s           1.8h                         (70%)                                                                      Both Parts
+                                                                         Group 2                                                                    Part 0 Only
+                                                                                    2   5    7    8       11 13 15
+                                                                         (49%)
+                                                                                                                                                    Part 1 Only
+                                                                         Group 3
+                                                                                   3    6    9    12 14                                             Dependency
+3.2. Sequence Partitioning                                               (34%)
+
+
+Pre-computed masks eliminate construction overhead, but                Figure 4. Sequence partitioning for within-sequence gradient accu-
+memory remains a bottleneck as sequences grow. Consider                mulation. Example: n = 16 tokens, K = 4 prediction depths (G0–
+                                                                       G3 denote groups in PARD terminology, where group g predicts
+an 8192-token sequence with K = 8 prediction depths and                the token g + 1 positions ahead). Depth 0 contains all positions;
+retention rate r = 0.8. The total positions across all depths          depths 1–3 contain progressively fewer due to COD sampling.
+follows n × (1 − rK )/(1 − r), yielding approximately 34K              Partitioning by depth-0 indices causes dependency violations: po-
+positions. Attention memory scales as O(L2 ) with total                sition 8 at depth 2 depends on position 7 at depth 1, but they land
+positions L, while embeddings and output logits scale as               in different segments. Our algorithm tracks assignments iteratively
+                                                                       across depths to preserve dependencies.
+O(L). Training at longer sequences requires managing this
+memory growth, which introduces two challenges.
+Challenge 1: Within-sequence gradient accumulation.                    Our solution: sequence partitioning technique. We track
+Standard gradient accumulation addresses memory con-                   segment assignments iteratively across prediction depths.
+straints by splitting a batch into micro-batches, where each           For depths 0 and 1, positions are assigned to segments based
+micro-batch contains one or more complete training ex-                 on their index. For depths d ≥ 2, each position is assigned
+amples. This assumes individual examples fit in memory.                to the same segment as its dependency at depth d − 1. This
+When a single sequence exceeds memory, a new approach is               iterative propagation guarantees that position p and its de-
+needed. We propose partitioning the sequence itself into seg-          pendency p−1 always reside in the same segment. Addition-
+ments, processing each with a separate forward-backward                ally, each segment includes depth-0 positions cumulatively
+pass, and accumulating gradients across segments. To our               up to its boundary to satisfy causal attention. Algorithm 1
+knowledge, this within-sequence gradient accumulation is               presents the pseudocode for the sequence partitioning tech-
+unique to parallel-prediction training and has not been ex-            nique.
+plored in prior work.                                                  Result. With S segments, peak attention memory reduces
+Challenge 2: Preserving cross-depth dependencies. Se-                  from O(L2 ) to O(L2 /S 2 ), enabling within-sequence gradi-
+quence partitioning is further complicated by COD’s atten-             ent accumulation while preserving all cross-depth attention
+tion structure. The causal constraint requires that position p         dependencies.
+at depth d attends to position p − 1 at depth d − 1. Mean-
+while, COD’s random sampling creates different position                4. Training Recipe
+sets at each depth, as illustrated in Figure 4. When partition-
+ing by position index, a position and its dependency may               This section presents ablation studies validating P-EAGLE’s
+land in different segments, violating the attention pattern.           design choices. We evaluate P-EAGLE on two out-of-
+                                                                       distribution benchmarks: HumanEval (Chen et al., 2021)
+Figure 4 provides a concrete example. Consider n = 16                  and MT-Bench (Zheng et al., 2023), reporting acceptance
+tokens with K = 4 prediction depths (G0–G3 in the                      length at speculation depth K=5. Unless otherwise noted,
+figure) and retention rate r = 0.7. Depth 0 contains                   ablations use LLaMA 3.1 8B (Grattafiori et al., 2024) as the
+all 16 positions, while depths 1–3 contain progressively               target model and a single decoder layer for P-EAGLE.
+fewer due to COD sampling—suppose depth 1 retains
+positions {1, 3, 4, 6, 7, 9, 10, 12, 14, 15}, depth 2 retains
+                                                                       4.1. Hidden State Design
+{2, 5, 7, 8, 11, 13, 15}, and depth 3 retains {3, 6, 9, 12, 14},
+yielding 38 total positions. To partition into 2 segments: if          A natural question is whether MTP positions should have
+we assign by depth-0 indices (positions 0–7 to Segment 0,              position-specific hidden states rather than sharing one. We
+positions 8–15 to Segment 1), position 8 at depth 2 lands              conduct this study using GPT-OSS 20B as the target model
+in Segment 1, but its dependency—position 7 at depth 1—                with a 4-layer P-EAGLE drafter. We evaluated four aug-
+lands in Segment 0. This breaks the required attention                 mentation strategies—adding depth-specific encodings (to
+pattern.                                                               distinguish MTP position 2, 3, 4...), injecting projected NTP
+
+                                                                   4
+                                   P-EAGLE: Parallel-Drafting EAGLE with Scalable Training
+
+Algorithm 1 Sequence Partitioning                                    solute position, from which parallel-prediction depth is com-
+Require: P = {P0 , P1 , . . . , PK−1 }: sampled positions            putable, eliminating the need for explicit depth encodings.
+    for K depths                                                     Similarly, the attention mechanism allows MTP positions
+Require: S: number of segments for gradient accumula-                to access NTP context directly, making auxiliary context
+    tion                                                             injection superfluous. We formalize this in Appendix B:
+Require: L: sequence length                                          absolute position is uniquely recoverable from RoPE-based
+Ensure: A: segment assignment for all positions                      attention scores (Theorem B.3).
+Ensure: N : cumulative depth-0 positions per segment                 Empirical confirmation. The regularized variant pro-
+ 1: // Initialize segment boundaries                                 vides direct evidence that the model actively learns to min-
+ 2: B ← {0, L       2L
+                S , S , . . . , L}                                   imize context injection. The learnable α decays exponen-
+ 3: // Phase 1: Assign segments for depths 0 and 1 by                tially from 0.1 to 0.029 over training—a 71% decrease—
+    position                                                         converging toward zero. Moreover, the baseline (no context
+ 4: for g ∈ {0, 1} do                                                injection) outperforms the regularized variant throughout
+ 5:     for p ∈ Pg do                                                training: at epoch 20, baseline achieves 57.9% MTP accu-
+ 6:       Ag [p] ← max{s : Bs ≤ p}                                   racy compared to 54.6% for the regularized variant. This
+ 7:     end for                                                      confirms that context injection hurts performance, and the
+ 8: end for                                                          model mitigates this by driving α toward zero. See Figure 5
+ 9: // Phase 2: Propagate assignments via dependencies               in Appendix B.2 for detailed trajectories.
+10: for g = 2 to K − 1 do
+11:     for p ∈ Pg do                                                4.2. Increasing Model Capacity
+12:       Ag [p] ← Ag−1 [p − 1] ▷ inherit from dependent
+          position                                                   The most impactful factor is model depth. Autoregressive
+13:     end for                                                      EAGLE achieves strong acceptance with a single layer be-
+14: end for                                                          cause each position conditions on the previously-generated
+15: // Phase 3: Accumulate NTP positions for causal atten-           token and hidden states, while P-EAGLE generates all to-
+    tion                                                             kens in parallel without access to intermediate tokens.
+16: for s = 0 to S − 1 do
+                                                                     Table 4. Effect of decoder layer count on P-EAGLE acceptance
+17:     Ns ← {p ∈ P0 : p < Bs+1 }                                    length. ∆% reports the relative change w.r.t. the 1-layer baseline
+18: end for                                                          on each benchmark.
+19: return A, N
+                                                                         Layers    HumanEval      MT-Bench             ∆%
+                                                                         1             2.69           2.41             —
+hidden states, or combining both. All underperformed the                 2             3.58           2.76       +33.1% / +14.5%
+simple shared hidden state by 7–15%. Results are shown in                4             3.92           3.04       +45.7% / +26.1%
+Table 3.
+                                                                     Table 4 shows that increasing from 1 to 2 layers provides the
+The “+ NTP hidden” variants inject the preceding NTP posi-           largest gain (+33% on HumanEval), with 4 layers achieving
+tion’s hidden state into MTP positions. The regularized vari-        an additional +9.5%. Although additional layers increase
+ant adds learnable scaling: hMTP = hshared + α · proj(hNTP ),        per-forward-pass latency, Section 5 demonstrates that the la-
+where α controls context injection strength. Formulations            tency savings from parallel drafting (i.e., reduction from K
+for all variants are in Appendix B.2.                                sequential forward passes to one forward pass) far outweigh
+                                                                     this overhead.
+Table 3. Hidden state ablation on HumanEval. Target: GPT-OSS
+20B. Training: 4-layer P-EAGLE, 20 epochs on OpenCodeInstruct.
+Evaluation: speculation length 5.                                    4.3. Unfreezing the Embedding Layer
+
+   Strategy                          Acc. Length    ∆%               Standard autoregressive EAGLE freezes the target model’s
+                                                                     embedding layer during training—the embeddings are al-
+   Baseline (learnable shared)          3.16         —
+                                                                     ready well-suited for representing actual tokens. P-EAGLE
+   + depth-specific encoding            2.85       −9.8%
+   + NTP hidden + depth encoding        2.68       −15.2%            introduces a mask token (i.e., a pre-defined unused token ID)
+   + NTP hidden only                    2.81       −11.1%            for MTP positions. A frozen embedding layer cannot adapt
+   + regularized NTP hidden             2.94       −7.0%             to encode meaningful information for this mask token.
+                                                                     Table 5 confirms that unfreezing embeddings provides con-
+Theoretical justification. We attribute this to functional           sistent +5% improvement across both evaluation datasets.
+redundancy. Rotary position embeddings already encode ab-            We hypothesize that the learned mask token embedding
+
+                                                                 5
+                                    P-EAGLE: Parallel-Drafting EAGLE with Scalable Training
+
+Table 5. Effect of unfreezing the embedding layer on P-EAGLE               length from 512 to 2048 yields +2% improvement. Since
+acceptance length. ∆% reports the relative change w.r.t. the frozen-
+embedding baseline on each benchmark.
+                                                                           LLaMA 3.1 8B is not a reasoning model, the gains are mod-
+                                                                           est, especially on these short-context evaluation datasets.
+ Freeze Emb.       HumanEval       MT-Bench            ∆%                  For reasoning-capable models with much longer outputs,
+ Yes (frozen)          2.56           2.29             —
+                                                                           as demonstrated in Table 1, the benefits of long-context
+ No (trainable)        2.69           2.41        +5.1% / +5.2%            training are more pronounced.
+
+                                                                           Table 8. Effect of maximum training sequence length on P-EAGLE
+encodes a “default next-token prior” that serves as a mean-                acceptance length. ∆% reports the relative change w.r.t. the 512-
+ingful starting point for parallel positions, complementing                token baseline on each benchmark.
+the learnable shared hidden state.                                           Max Seq Len     HumanEval      MT-Bench            ∆%
+                                                                             512                 2.51          2.26            —
+4.4. Training vs. Inference Speculation Depth                                2048                2.56          2.29       +2.0% / +1.3%
+P-EAGLE trains with Ktrain parallel prediction groups and
+speculates with depth Kinfer at inference. A natural question              The key insight is that P-EAGLE requires “capacity com-
+is whether these should match.                                             pensation” for the information loss inherent in parallel pre-
+Table 6. Effect of training speculation depth on P-EAGLE                   diction: more layers to transform shared input into position-
+acceptance length. ∆% reports the relative change w.r.t. the               specific representations, trainable embeddings to encode the
+Ktr =5, Kinf =5 baseline on each benchmark.                                mask token meaningfully, and extended training to master
+                                                                           the harder attention-based context extraction. With these
+   Ktr    Kinf    HumanEval      MT-Bench             ∆%
+                                                                           adaptations, P-EAGLE achieves acceptance rates compet-
+    5      5          2.41           2.20            —                     itive with autoregressive EAGLE while reducing drafting
+    8      5          2.51           2.26       +4.1% / +2.7%              latency through parallelism. For comprehensive comparison,
+                                                                           see Section 5.
+Table 6 shows that training with Ktrain = 8 while inferring at
+Kinfer = 5 yields +4% improvement over matched settings.                   5. Experiments
+Training with longer prediction horizons encourages the
+model to learn more robust multi-step dependencies, with                   We evaluate P-EAGLE across three popular open-source
+positions 6–8 providing additional supervision that benefits               models, comparing against autoregressive (AR) EAGLE-3
+positions 1–5. Interestingly, PARD (An et al., 2025) demon-                on acceptance length and end-to-end inference throughput
+strates that standalone draft models can extrapolate in the                from high-performance inference framework vLLM.
+opposite direction (Kinfer > Ktrain ).
+                                                                           5.1. Experimental Setup
+4.5. Extended Training Duration
+                                                                           We evaluate P-EAGLE on GPT-OSS 120B, GPT-OSS 20B,
+P-EAGLE faces a harder learning problem than autoregres-                   and Qwen3-Coder 30B. Based on the capacity analysis in
+sive EAGLE: it must learn to extract position-specific in-                 Section 4.2, we train P-EAGLE with 4 decoder layers. For
+formation via attention rather than receiving it directly as               comparison with 2-layer P-EAGLE, see Appendix C.
+input. We find that extended training duration improves
+                                                                           Training configuration. All models are trained with max-
+acceptance, as shown in Table 7.
+                                                                           imum sequence length 8192 tokens, parallel prediction
+Table 7. Effect of training duration on P-EAGLE acceptance length.         groups Ktrain = 8, and COD down-sampling ratio 0.8.
+∆% reports the relative change w.r.t. the 20-epoch baseline on each        We use batch size 8 with micro-batch size 1 (8-step gra-
+benchmark.                                                                 dient accumulation), linear learning rate schedule with peak
+                                                                           1 × 10−4 and warmup ratio 0.0025. Training is conducted
+     Epochs      HumanEval      MT-Bench            ∆%                     on 8× H200 GPUs. We use identical training configurations
+     20             3.92           3.04            —                       across all three target models to ensure fair comparison.
+     40             3.98           3.15       +1.5% / +3.6%
+     60             4.00           3.18       +2.0% / +4.6%                Training data. We train both P-EAGLE and AR EAGLE 3
+                                                                           on three datasets: UltraChat (Ding et al., 2023), GSM-8K
+                                                                           (train split) (Cobbe et al., 2021), OpenCodeInstruct (Ahmad
+4.6. Longer Training Sequences                                             et al., 2025).
+Finally, we find that increasing training sequence length im-              Evaluation. We evaluate on three out-of-distribution bench-
+proves acceptance. Table 8 shows that increasing sequence                  marks: HumanEval (code generation) (Chen et al., 2021),
+
+                                                                       6
+                                    P-EAGLE: Parallel-Drafting EAGLE with Scalable Training
+
+MT-Bench (multi-turn conversation) (Zheng et al., 2023),                   Table 9. Acceptance length comparison across three models on
+                                                                           three out-of-distribution benchmarks. Speculation depth K = 5,
+and GSM-8K test split (mathematical reasoning) (Cobbe                      max new tokens 2048. Percentages denote improvement over AR
+et al., 2021).                                                             EAGLE-3.
+Baseline. We compare P-EAGLE against AR EAGLE-3                             Model             Dataset      AR EAGLE-3    P-EAGLE (4L)
+as our primary baseline. The baseline follows the canon-
+                                                                                              HumanEval        3.5         3.5 (0.0%)
+ical single-layer design from Li et al. (2025)3 . We also                                     MT-Bench         2.7        2.9 (+10.2%)
+                                                                            GPT-OSS 120B
+implemented the Harmonized Context Alignment (HCA)                                            GSM-8K           3.3        3.5 (+5.2%)
+loss (Zhang et al., 2024) (AR-specific) in training the base-                                 Average          3.1        3.3 (+4.5%)
+line drafter, yielding strong absolute performance (e.g., ac-                                 HumanEval        3.7         3.8 (+2.4%)
+ceptance length of 4.36 out of speculation length 5 on Hu-                                    MT-Bench         3.4         3.4 (+1.5%)
+                                                                            GPT-OSS 20B
+                                                                                              GSM-8K           3.9         4.0 (+3.1%)
+manEval for Qwen3-Coder 30B, approaching the theoretical                                      Average          3.7         3.7 (+2.5%)
+maximum of 6.0). This represents a more challenging base-                                     HumanEval        4.4         4.5 (+3.7%)
+line than alternatives such as Medusa (Cai et al., 2024) or                                   MT-Bench         3.0         3.0 (+0.3%)
+                                                                            Qwen3-Coder 30B
+Lookahead decoding (Fu et al., 2024).                                                         GSM-8K           3.1         3.2 (+1.0%)
+                                                                                              Average          3.5         3.6 (+2.0%)
+ParallelSpec (Xiao et al., 2024b) and PARD (An et al., 2025)
+are excluded from comparison due to scalability limitations                ready highly optimized. We provide a comparison between
+demonstrated in Table 1. Both ParallelSpec and PARD en-                    2-layer and 4-layer P-EAGLE in Appendix C.
+counter out-of-memory failures at 8K context length during
+training. Since production training for reasoning-capable                  5.3. Experimental results from vLLM
+models requires 8K+ context support, these methods cannot                  We implement P-EAGLE’s parallel drafting in vLLM and
+be evaluated under equivalent conditions.                                  report the Output Tokens Per Second (OTPS) across all
+                                                                           three models and benchmarks in Table 10. A key advan-
+5.2. Acceptance Length Comparison                                          tage of P-EAGLE is its ability to draft more tokens without
+Before examining end-to-end performance, we establish                      proportional cost increase—while AR EAGLE-3 achieves
+that P-EAGLE achieves comparable acceptance length to                      optimal throughput at K=3, P-EAGLE efficiently scales to
+autoregressive EAGLE-3. This is a necessary condition: if                  K=5–7 by generating all draft tokens in a single forward
+parallel drafting substantially degraded draft quality, latency            pass. This higher speculation depth reduces the total number
+savings would be offset by reduced acceptance rates.                       of generation iterations required to complete a response. As
+                                                                           a result, P-EAGLE achieves up to 1.36× speedup at concur-
+Key insight. The goal of this comparison is not to demon-                  rency C=2, with gains varying by model size: 1.27×–1.36×
+strate that P-EAGLE achieves higher acceptance length—                     for 20B, 1.04×–1.10× for 120B, and 1.04×–1.17× for Qwen
+rather, we show that parallel drafting can match autoregres-               30B. At higher concurrency (C=4), speedups remain strong
+sive quality with modest additional capacity (2–4 layers                   for 20B (1.24×–1.27×) while moderating for larger mod-
+vs. 1 layer). The true benefit of P-EAGLE lies in end-to-                  els (1.03×–1.11×) as verification latency becomes domi-
+end throughput improvement (Section 5.3), not acceptance                   nant—for MoE models, expert routing overhead scales with
+length superiority.                                                        batch size, shifting the bottleneck from drafting to verifi-
+Table 9 presents acceptance length results across all con-                 cation. For Qwen 30B on HumanEval at K=3, P-EAGLE
+figurations. Key observations: (1) P-EAGLE matches or                      shows slight slowdowns (0.98× at C=2, 0.92× at C=4) due
+exceeds AR EAGLE-3 across all 9 model-dataset combina-                     to its deeper architecture: a single 4-layer forward pass
+tions. The average improvement is +4.5% for GPT-OSS                        can exceed three sequential 1-layer passes at low specula-
+120B, +2.5% for GPT-OSS 20B, and +2.0% for Qwen3-                          tion depth. This overhead is amortized at K=5–7, where
+Coder 30B. (2) Qwen3-Coder 30B presents the most chal-                     speedups reach 1.11×–1.17×.
+lenging baseline: AR EAGLE-3 achieves acceptance length
+of 4.36 on HumanEval, approaching the theoretical max-                     6. Related Work
+imum of 6.0 for K = 5. Nevertheless, P-EAGLE con-
+sistently matches or exceeds the baseline across all three                 A variety of techniques have been explored to accelerate in-
+benchmarks (+3.7% on HumanEval, +0.3% on MT-Bench,                         ference in large language models (LLMs), such as quantiza-
++1.0% on GSM-8K), confirming that parallel drafting main-                  tion and knowledge distillation. However, these approaches
+tains quality even when the autoregressive baseline is al-                 generally trade model performance for speed. Speculative
+                                                                           sampling enables lossless acceleration by verifying drafted
+   3
+     Under sequential generation, drafting latency scales with layer       tokens in parallel using the target model (Leviathan et al.,
+count, offsetting the marginal acceptance-length gains. Single-            2023; Chen et al., 2023). Early works primarily relied on
+layer is thus optimal for AR EAGLE throughput.
+                                                                           smaller standalone models (Miao et al., 2023) or retrieval-
+
+                                                                       7
+                                   P-EAGLE: Parallel-Drafting EAGLE with Scalable Training
+
+Table 10. Output Tokens Per Second (OTPS) across speculation depths K and concurrency levels (C). At each K, OTPS measures total
+throughput across all concurrent requests. Underline indicates AR baseline (optimal K). P-EAGLE speedups (in parentheses) are relative
+to this baseline; bold indicates best speedup. HE=HumanEval, MT=MT-Bench, GSM=GSM-8K. All experiments use chain drafting and
+are measured on 1 H200 GPU.
+
+                                                       C=2                                               C=4
+  Model         Method       K          HE             MT                GSM              HE             MT              GSM
+                              3        592              516               612             864            774             930
+                AR            5        566              457               606             841            698             936
+                              7        503              402               555             774            620             869
+  120B
+                              3    616 (1.04×)      537 (1.04×)       636 (1.04×)    883 (1.02×)     790 (1.02×)     939 (1.00×)
+                P-EAGLE       5    632 (1.07×)      536 (1.04×)       676 (1.10×)    898 (1.04×)     799 (1.03×)     993 (1.06×)
+                              7    606 (1.02×)      516 (1.00×)       672 (1.10×)    879 (1.02×)     758 (0.98×)     988 (1.06×)
+                              3        929              894               957            1538            1524            1612
+                AR            5        912              851               968            1562            1486            1696
+                              7        833              776               912            1407            1387            1600
+  20B
+                              3   1001 (1.08×)     965 (1.08×)        1064 (1.10×)   1597 (1.02×)    1663 (1.09×)    1762 (1.04×)
+                P-EAGLE       5   1173 (1.26×)     1087 (1.22×)       1218 (1.26×)   1876 (1.20×)    1883 (1.24×)    2054 (1.21×)
+                              7   1205 (1.30×)     1135 (1.27×)       1320 (1.36×)   1950 (1.25×)    1882 (1.23×)    2147 (1.27×)
+                              3        674              547               604            1046            869             932
+                AR            5        737              521               602            1160            825             992
+                              7        725              493               576            1107            784             932
+  Qwen 30B
+                              3    696 (0.94×)      559 (1.02×)       613 (1.01×)    1066 (0.92×)    871 (1.00×)      967 (0.97×)
+                P-EAGLE       5    820 (1.11×)      571 (1.04×)       653 (1.08×)    1225 (1.06×)    907 (1.04×)     1049 (1.06×)
+                              7    860 (1.17×)      558 (1.02×)       638 (1.06×)    1285 (1.11×)    882 (1.01×)     1030 (1.04×)
+
+based approaches, such as REST (He et al., 2023), to gen-              extended reasoning workloads.
+erate draft candidates. More recent methods like EAGLE,
+                                                                       As generation lengths have increased, there have been
+Mixture of Attentions, and HASS exploit intermediate rep-
+                                                                       several approaches to supporting long-context workloads.
+resentations of the target model to improve decoding effi-
+                                                                       Some techniques limit the set of tokens preserved in the KV-
+ciency (Li et al., 2025; Zimmer et al., 2025; Zhang et al.,
+                                                                       cache to limit attention overheads (Xiao et al., 2024a; Belt-
+2024). GLIDE and CAPE (Du et al., 2024) instead reuse
+                                                                       agy et al., 2020; Zhang et al., 2023; Sun et al., 2024). Others
+the target model’s key–value cache and confidence scores.
+                                                                       quantize the KV cache (Xiao et al., 2023; Hooper et al.,
+However, these techniques still only generate one token per
+                                                                       2024; Sheng et al., 2023; Liu et al., 2024; Yue et al., 2024).
+forward-pass through the draft model, limiting throughput.
+                                                                       While these techniques increase the maximum supportable
+Parallel token drafting mitigates the autoregressive bot-              context length, they can lead to loss of model performance.
+tleneck by predicting multiple tokens per forward pass.                Sadhukhan et al. combined these lossy techniques with spec-
+Self-drafting methods modify the target model to produce               ulative decoding to provide net lossless speedup (Chen et al.,
+multiple speculative tokens in parallel (Gloeckle et al.,              2024a). These techniques are orthogonal to our approach
+2024; Cai et al., 2024; Monea et al., 2023). Parallel-                 and could be combined to further increase context lengths.
+Spec shows that a discrete, EAGLE-style parallel drafter
+can outperform autoregressive EAGLE and self-drafting                  7. Conclusion
+Medusa in speed (Xiao et al., 2024b), while PARD re-
+duces the training cost of parallel prediction via Condi-              We presented P-EAGLE, transforming EAGLE-style specu-
+tional Drop-token (An et al., 2025). In parallel, Falcon               lative decoding from autoregressive to parallel multi-token
+improves semi-autoregressive speculative decoding through              prediction via learnable shared hidden state and mask to-
+dependency-aware training and a custom decoding tree, tar-             ken embeddings. Our training framework with mask pre-
+geting higher draft quality under SAR generation (Gao et al.,          computation and sequence partitioning enables scalable
+2025). Cascade Speculative Drafting instead reduces draft-             long-context training, addressing a key bottleneck in prior
+ing latency by cascading multiple draft models (down to a              parallel drafting approaches. We implement P-EAGLE in
+statistical model) and allocating computation by draft po-             vLLM, achieving 1.10×–1.36× speedup over autoregres-
+sition (Chen et al., 2024b). In contrast, P-EAGLE uses a               sive EAGLE-3 across GPT-OSS 120B, GPT-OSS 20B, and
+target-conditioned EAGLE drafter with parallel multi-token             Qwen3-Coder 30B. These results establish parallel drafting
+prediction, and focuses on scalable long-context training for          as a viable direction for production LLM acceleration.
+
+
+                                                                  8
+                                 P-EAGLE: Parallel-Drafting EAGLE with Scalable Training
+
+References                                                            Ding, N., Chen, Y., Xu, B., Qin, Y., Hu, S., Liu, Z., Sun, M.,
+                                                                        and Zhou, B. Enhancing chat language models by scaling
+Ahmad, W. U., Ficek, A., Samadi, M., Huang, J., Noroozi,
+                                                                        high-quality instructional conversations. In Proceedings
+ V., Majumdar, S., and Ginsburg, B. Opencodeinstruct: A
+                                                                        of the 2023 Conference on Empirical Methods in Natural
+  large-scale instruction tuning dataset for code llms. 2025.
+                                                                        Language Processing, pp. 3029–3051, 2023.
+  URL https://arxiv.org/abs/2504.04030.
+                                                                      Du, C., Jiang, J., Yuanchen, X., Wu, J., Yu, S., Li, Y., Li, S.,
+An, Z., Bai, H., Liu, Z., Li, D., and Barsoum, E. PARD: Ac-
+                                                                        Xu, K., Nie, L., Tu, Z., and You, Y. Glide with a cape:
+  celerating LLM inference with low-cost parallel draft
+                                                                        a low-hassle method to accelerate speculative decoding.
+  model adaptation. arXiv preprint arXiv:2504.18583,
+                                                                        In Proceedings of the 41st International Conference on
+  2025.
+                                                                        Machine Learning, ICML’24. JMLR.org, 2024.
+Beltagy, I., Peters, M. E., and Cohan, A. Longformer: The
+                                                                      Fu, Y., Bailis, P., Stoica, I., and Zhang, H. Break the se-
+  long-document transformer. arXiv:2004.05150, 2020.
+                                                                        quential dependency of llm inference using lookahead
+Cai, T., Li, Y., Geng, Z., Peng, H., Lee, J. D., Chen, D.,              decoding. arXiv preprint arXiv:2402.02057, 2024.
+  and Dao, T. Medusa: Simple llm inference acceleration
+                                                                      Gao, X., Xie, W., Xiang, Y., and Ji, F. Falcon: Faster and
+  framework with multiple decoding heads. arXiv preprint
+                                                                        parallel inference of large language models through en-
+  arXiv:2401.10774, 2024.
+                                                                        hanced semi-autoregressive drafting and custom-designed
+Chen, C., Borgeaud, S., Irving, G., Lespiau, J.-B., Sifre,              decoding tree. In Proceedings of the AAAI Conference
+  L., and Jumper, J. Accelerating large language model                  on Artificial Intelligence, volume 39, pp. 23933–23941,
+  decoding with speculative sampling. arXiv preprint                    2025.
+  arXiv:2302.01318, 2023.
+                                                                      Gloeckle, F., Idrissi, B. Y., Rozière, B., Lopez-Paz, D., and
+Chen, J., Tiwari, V., Sadhukhan, R., Chen, Z., Shi, J., Yen, I.         Synnaeve, G. Better & faster large language models via
+  E.-H., and Chen, B. Magicdec: Breaking the latency-                   multi-token prediction. In Proceedings of the 41st In-
+  throughput tradeoff for long context generation with                  ternational Conference on Machine Learning, ICML’24.
+  speculative decoding. arXiv preprint arXiv:2408.11049,                JMLR.org, 2024.
+  2024a.
+                                                                      Grattafiori, A., Dubey, A., Jauhri, A., Pandey, A., Kadian,
+Chen, M., Tworek, J., Jun, H., Yuan, Q., de Oliveira Pinto,             A., Al-Dahle, A., Letman, A., Mathur, A., Schelten, A.,
+  H. P., Kaplan, J., Edwards, H., Burda, Y., Joseph, N.,                Vaughan, A., et al. The llama 3 herd of models. arXiv
+  Brockman, G., Ray, A., Puri, R., Krueger, G., Petrov,                 preprint arXiv:2407.21783, 2024.
+  M., Khlaaf, H., Sastry, G., Mishkin, P., Chan, B., Gray,
+                                                                      He, Z., Zhong, Z., Cai, T., Lee, J. D., and He, D. Rest:
+  S., Ryder, N., Pavlov, M., Power, A., Kaiser, L., Bavar-
+                                                                        Retrieval-based speculative decoding. arXiv preprint
+  ian, M., Winter, C., Tillet, P., Such, F. P., Cummings, D.,
+                                                                        arXiv:2311.08252, 2023.
+  Plappert, M., Chantzis, F., Barnes, E., Herbert-Voss, A.,
+  Guss, W. H., Nichol, A., Paino, A., Tezak, N., Tang,                Hooper, C., Kim, S., Mohammadzadeh, H., Mahoney,
+  J., Babuschkin, I., Balaji, S., Jain, S., Saunders, W.,               M. W., Shao, Y. S., Keutzer, K., and Gholami, A.
+  Hesse, C., Carr, A. N., Leike, J., Achiam, J., Misra,                 Kvquant: Towards 10 million context length llm in-
+  V., Morikawa, E., Radford, A., Knight, M., Brundage,                  ference with kv cache quantization. arXiv preprint
+  M., Murati, M., Mayer, K., Welinder, P., McGrew, B.,                  arXiv:2401.18079, 2024.
+  Amodei, D., McCandlish, S., Sutskever, I., and Zaremba,
+  W. Evaluating large language models trained on code.                Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+  2021.                                                                C. H., Gonzalez, J. E., Zhang, H., and Stoica, I. Efficient
+                                                                       memory management for large language model serving
+Chen, Z., Yang, X., Lin, J., Sun, C., Chang, K. C., and                with pagedattention. In Proceedings of the ACM SIGOPS
+  Huang, J. Cascade speculative drafting for even faster llm           29th Symposium on Operating Systems Principles, 2023.
+  inference. Advances in Neural Information Processing
+  Systems, 37:86226–86242, 2024b.                                     Leviathan, Y., Kalman, M., and Matias, Y. Fast inference
+                                                                        from transformers via speculative decoding. International
+Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H.,               Conference on Machine Learning, 2023.
+  Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano,
+  R., Hesse, C., and Schulman, J. Training verifiers to solve         Li, Y., Wei, F., Zhang, C., and Zhang, H. Eagle: Speculative
+  math word problems. arXiv preprint arXiv:2110.14168,                   sampling requires rethinking feature uncertainty. arXiv
+  2021.                                                                  preprint arXiv:2401.15077, 2024.
+
+                                                                  9
+                                P-EAGLE: Parallel-Drafting EAGLE with Scalable Training
+
+Li, Y., Wei, F., Zhang, C., and Zhang, H. EAGLE-3: Scal-             Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J., and Han,
+  ing up inference acceleration of large language models               S. SmoothQuant: Accurate and efficient post-training
+  via training-time test. arXiv preprint arXiv:2503.01840,             quantization for large language models. In Proceedings of
+  2025.                                                                the 40th International Conference on Machine Learning,
+                                                                       2023.
+Lin, F., Yi, H., Yang, Y., Li, H., Yu, X., Lu, G., and Xiao,
+  R. Bita: Bi-directional tuning for lossless acceleration in        Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Effi-
+  large language models. Expert Systems with Applications,             cient streaming language models with attention sinks. In
+  pp. 127305, 2025.                                                    The Twelfth International Conference on Learning Rep-
+                                                                       resentations, 2024a. URL https://openreview.
+Liu, H. and Zhou, H. Rethinking rope: A mathematical                   net/forum?id=NG7sS51zVF.
+  blueprint for n-dimensional positional encoding. arXiv
+  preprint arXiv:2504.06308, 2025.                                   Xiao, Z., Zhang, H., Ge, T., Ouyang, S., Ordonez, V., and
+                                                                       Yu, D. Parallelspec: Parallel drafter for efficient specula-
+Liu, Z., Yuan, J., Jin, H., Zhong, S., Xu, Z., Braverman,              tive decoding. arXiv preprint arXiv:2410.05589, 2024b.
+  V., Chen, B., and Hu, X. Kivi: A tuning-free asym-
+                                                                     Yue, Y., Yuan, Z., Duanmu, H., Zhou, S., Wu, J.,
+  metric 2bit quantization for kv cache. arXiv preprint
+                                                                       and Nie, L.    Wkvquant: Quantizing weight and
+  arXiv:2402.02750, 2024.
+                                                                       key/value cache for large language models gains
+Miao, X., Oliaro, G., Zhang, Z., Cheng, X., Wang, Z., Wong,            more. ArXiv, abs/2402.12065, 2024. URL https:
+ R. Y. Y., Chen, Z., Arfeen, D., Abhyankar, R., and Jia,               //api.semanticscholar.org/CorpusID:
+ Z. Specinfer: Accelerating generative large language                  267750952.
+ model serving with tree-based speculative inference and             Zhang, L., Wang, X., Huang, Y., and Xu, R. Learning har-
+ verification. arXiv preprint arXiv:2305.09781, 2023.                  monized representations for speculative sampling. arXiv
+                                                                       preprint arXiv:2408.15766, 2024.
+Monea, G., Joulin, A., and Grave, E. Pass: Parallel specu-
+ lative sampling, 2023. URL https://arxiv.org/                       Zhang, Z., Sheng, Y., Zhou, T., Chen, T., Zheng, L., Cai,
+ abs/2311.13581.                                                       R., Song, Z., Tian, Y., Ré, C., Barrett, C., Wang, Z., and
+                                                                       Chen, B. H2o: heavy-hitter oracle for efficient generative
+NVIDIA. Tensorrt-llm: High-performance inference                       inference of large language models. In Proceedings of
+ optimization for large language models. https:                        the 37th International Conference on Neural Information
+ //github.com/NVIDIA/TensorRT-LLM, 2023–                               Processing Systems, NIPS ’23, Red Hook, NY, USA,
+ 2025. Version X.Y.Z.                                                  2023. Curran Associates Inc.
+OpenAI. gpt-oss-120b & gpt-oss-20b model card, 2025.                 Zheng, L., Chiang, W.-L., Sheng, Y., Zhuang, S., Wu, Z.,
+  URL https://arxiv.org/abs/2508.10925.                                Zhuang, Y., Lin, Z., Li, Z., Li, D., Xing, E., et al. Judging
+                                                                       llm-as-a-judge with mt-bench and chatbot arena. Ad-
+Sheng, Y., Zheng, L., Yuan, B., Li, Z., Ryabinin, M., Chen,            vances in neural information processing systems, 36:
+  B., Liang, P., Ré, C., Stoica, I., and Zhang, C. Flexgen:           46595–46623, 2023.
+  high-throughput generative inference of large language
+  models with a single gpu. In Proceedings of the 40th In-           Zheng, L., Yin, L., Xie, Z., Sun, C. L., Huang, J., Yu, C. H.,
+  ternational Conference on Machine Learning, ICML’23.                 Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., et al.
+  JMLR.org, 2023.                                                      Sglang: Efficient execution of structured language model
+                                                                       programs. Advances in neural information processing
+Su, J., Lu, Y., Pan, S., Murtadha, A., Wen, B., and Liu, Y.            systems, 37:62557–62583, 2024.
+  RoFormer: Enhanced transformer with rotary position
+  embedding. Neurocomputing, 568:127063, 2024.                       Zimmer, M., Gritta, M., Lampouras, G., Ammar, H. B., and
+                                                                       Wang, J. Mixture of attentions for speculative decod-
+Sun, H., Chen, Z., Yang, X., Tian, Y., and Chen, B. Tri-               ing, 2025. URL https://arxiv.org/abs/2410.
+  force: Lossless acceleration of long sequence generation             03804.
+  with hierarchical speculative decoding. In First Con-
+  ference on Language Modeling, 2024. URL https:
+  //openreview.net/forum?id=HVK6nl3i97.
+
+Team, Q. Qwen3 technical report, 2025. URL https:
+  //arxiv.org/abs/2505.09388.
+
+                                                                10
+                                  P-EAGLE: Parallel-Drafting EAGLE with Scalable Training
+
+A. Training configuration of ParallelSpec and PARD
+All models are trained on 8 H200 GPUs with a global batch size of 64 and 8-step gradient accumulation. The target model is
+GPT-OSS 120B. We use a linear learning-rate schedule with a peak learning rate of 1 × 10−4 and a warmup ratio of 0.0025.
+
+B. Theoretical Justification for Redundancy of Hidden State Augmentation
+We provide theoretical justification for why augmenting the shared hidden state—whether through prediction depth
+embeddings or projected NTP context—is redundant. The key observation is that prediction depth g is a deterministic
+function of sequence position p: in the MTP training structure, each position maps to exactly one prediction depth via g(p).
+We prove that absolute position p can be uniquely recovered from RoPE-based attention scores. Since g(p) is computable
+from p, introducing depth-dependent hidden states provides no additional information to the model.
+Liu & Zhou (2025) prove that the mapping δ 7→ Rδ from relative position between a pair of query and key (q, k) ∈ Rd × Rd
+to RoPE rotation matrix is injective, i.e., distinct relative positions always produce distinct rotation matrices. With a reference
+token at known position (e.g., BOS at position 0), this implies absolute position is recoverable from the rotation matrix.
+However, transformers do not observe rotation matrices directly; they compute scalar attention scores q⊤ Rδ k. The question
+then arises: is the attention score mapping δ 7→ q⊤ Rδ k also injective? We prove that the set of query-key pairs for which
+injectivity fails has Lebesgue measure zero.
+Theorem B.1 (Liu & Zhou (2025)). The mapping δ 7→ Rδ from relative position to RoPE rotation matrix is injective, i.e.,
+Rδ1 = Rδ2 =⇒ δ1 = δ2 .
+Lemma B.2. Let M ∈ Rd×d be a non-zero matrix. The set ZM = {(q, k) ∈ Rd × Rd : q⊤ M k = 0} has Lebesgue
+measure zero in R2d .
+
+Proof. Since M ̸= 0, there exist indices (i∗ , j ∗ ) such that Mi∗ j ∗ ̸= 0. The bilinear form q⊤ M k = i,j qi Mij kj is
+                                                                                                       P
+a polynomial in 2d variables with the non-zero monomial Mi∗ j ∗ qi∗ kj ∗ . Since a non-zero polynomial defines a proper
+algebraic hypersurface, its zero set has Lebesgue measure zero.
+
+Theorem B.3 (Attention Score-Level Injectivity). The set of (q, k) ∈ Rd × Rd for which the attention score function
+fq,k (δ) = q⊤ Rδ k fails to be injective in relative position δ has Lebesgue measure zero.
+
+Proof. Let q, k ∈ Rd be query and key vectors, and consider any δ1 ̸= δ2 . By Theorem B.1, Rδ1 ̸= Rδ2 , thus M = Rδ1 −
+Rδ2 ̸= 0. The condition fq,k (δ1 ) = fq,k (δ2 ) can be rewritten as q⊤ Rδ1 k = q⊤ Rδ2 k, or equivalently q⊤ (Rδ1 − Rδ2 )k =
+q⊤ M k = 0. By Lemma B.2, since M ̸= 0, the set of (q, k) satisfying q⊤ M k = 0 has Lebesgue measure zero.
+
+Corollary B.4 (Absolute Position Recovery). Let r be a reference position with key vector kr ∈ Rd , and let m be a query
+position with query vector q ∈ Rd . The set of query vectors for which the attention score sm,r = q⊤ Rr−m kr fails to
+uniquely determine m has Lebesgue measure zero.
+
+Proof. Since r is fixed, distinct absolute positions m1 ̸= m2 correspond to distinct relative positions δ1 = r − m1 ̸=
+r − m2 = δ2 . By Theorem B.3, the set of (q, kr ) for which the attention score function δ 7→ q⊤ Rδ kr fails to be injective
+has Lebesgue measure zero. Therefore, sm1 ,r = q⊤ Rδ1 kr ̸= q⊤ Rδ2 kr = sm2 ,r except on a Lebesgue measure-zero set,
+and absolute position m = r − δ is uniquely recoverable.
+
+B.1. Application to Hidden State Augmentation
+Consider the prediction depth embedding approach, which adds a learnable embedding to differentiate prediction depth:
+ (g)                (g)
+hMTP = hshared + edepth , where g ∈ {1, . . . , K} denotes the prediction depth (1-step ahead, 2-steps ahead, etc.). The
+prediction depth is a deterministic function of sequence position: in the MTP training structure, each position p maps to
+exactly one depth g(p). By Corollary B.4, absolute position is already recoverable from RoPE attention scores. Since g(p) is
+                                             (g)
+computable from p, the explicit embedding edepth provides no information beyond what is already encoded in RoPE attention
+patterns.
+For approaches that inject projected NTP context into hidden states, analogous redundancy arises: MTP positions already
+attend to NTP positions and receive their information through the attention output, making the additional projection pathway
+
+                                                               11
+                                                                         P-EAGLE: Parallel-Drafting EAGLE with Scalable Training
+
+redundant. The general principle is that in RoPE-based transformers, explicit injection of information already accessible
+through attention is representationally unnecessary and harmful to optimization.
+
+B.2. Hidden State Ablation Details
+We evaluated five hidden state strategies for MTP positions. In PARD (An et al., 2025), prediction depth is referred to
+as “group index” where group g ∈ {1, . . . , K} predicts the (g + 1)-th future token. We use the more descriptive term
+“prediction depth” throughout.
+
+   • Baseline (learnable shared): A single learnable vector hshared shared across all MTP positions. This is our recom-
+     mended approach.
+                                                                                                                                                                                                                    (g)                            (g)
+   • + depth-specific encoding: Add a learnable embedding to differentiate prediction depth: hMTP = hshared + edepth ,
+     where g ∈ {1, . . . , K} indicates predicting 1-step ahead, 2-steps ahead, etc. This is distinct from sequence position
+     IDs (RoPE) used in attention.
+
+   • + NTP hidden + depth encoding: Project the last NTP hidden state and combine with prediction depth embedding:
+       (g)                           (g)
+     hMTP = hshared + proj(hntp ) + edepth , where proj(·) is a linear layer. This provides both explicit context from the NTP
+     position and prediction depth information.
+
+   • + NTP hidden only: Project the last NTP hidden state without depth embedding: hMTP = hshared + proj(hntp ), injecting
+     context while relying on attention for depth differentiation.
+
+   • + regularized NTP hidden: Add projected NTP hidden state with dropout regularization and learnable scaling:
+     hMTP = hshared + α · dropout(proj(hntp )). The scalar α is initialized to 0.1, allowing the model to start near baseline
+     behavior (α ≈ 0 ignores context) and learn whether to increase α if context helps. Dropout (rate 0.1) prevents
+     overfitting to specific context patterns.
+
+All alternatives underperformed the simple learnable shared hidden state (baseline) by 7–15% (see Table 3 in main paper).
+The theoretical analysis above explains this result: the augmentation provides redundant information that interferes with
+optimization.
+
+                                              Learnable Decreases Over Training                                            MTP Accuracy: V5 vs Baseline                                               NTP-MTP Gap: V5 vs Baseline
+                                              (Model "turns off" context injection)                                         (Baseline outperforms V5)                                                 (Baseline achieves lower gap)
+                                  0.12                                                                         60
+                                                                            Initial = 0.1                                              Baseline: 57.9%                                                                    V5 (context injection)
+                                                                            Final = 0.029                                                                                                                                 Baseline (no context)
+                                                                                                                                                                                           30                                   V5: 27.4%
+                                  0.10
+                                                                                                               50
+      (Context Influence Scale)
+
+
+
+
+                                                                                                                                              V5: 54.6%
+                                                                                                                                                                                           25
+                                  0.08
+                                                                                            MTP Accuracy (%)
+
+
+
+
+                                                                                                                                                                         NTP-MTP Gap (%)
+
+
+
+
+                                                                                                               40                                                                                                               Baseline: 24.6%
+                                                                                                                                                                                           20
+                                  0.06
+                                                                                                               30
+                                                                  71% decrease                                                                                                             15
+                                  0.04
+                                                                                                               20                                                                          10
+                                  0.02
+                                                                                                                                                V5 (context injection)
+                                                                                                                                                Baseline (no context)                      5
+                                  0.00                                                                         10
+                                         0   250 500 750 1000 1250 1500 1750 2000                                   2.5   5.0   7.5   10.0 12.5 15.0 17.5 20.0                                  2.5   5.0   7.5   10.0 12.5 15.0 17.5 20.0
+                                                         Training Step                                                                Epoch                                                                       Epoch
+
+Figure 5. Learnable α trajectory and comparison with baseline. Left: α decreases 71% from initialization, converging to ∼0.03. Center:
+MTP accuracy comparison—baseline (no context injection) achieves 57.9% versus the regularized variant’s 54.6%. Right: NTP-MTP
+gap comparison—baseline achieves a lower gap (24.6%) than the regularized variant (27.4%). The model actively learns to minimize
+context injection because it hurts performance.
+
+
+
+C. 2-Layer vs 4-Layer P-EAGLE Comparison
+Table 11 compares acceptance length between 2-layer and 4-layer P-EAGLE configurations. The 2-layer variant was trained
+for fewer epochs and serves as a capacity-latency tradeoff point: while it offers lower per-forward-pass latency, 4-layer
+P-EAGLE consistently achieves higher acceptance lengths across all benchmarks.
+
+                                                                                                                                  12
+                               P-EAGLE: Parallel-Drafting EAGLE with Scalable Training
+
+Table 11. Acceptance length comparison between 2-layer and 4-layer P-EAGLE. Speculation depth K = 5, max new tokens 2048.
+Percentages denote change relative to AR EAGLE-3.
+
+  Model                        Dataset            AR EAGLE-3             P-EAGLE (2L)             P-EAGLE (4L)
+                               HumanEval                  3.5              3.2 (−6.4%)               3.5 (0.0%)
+                               MT-Bench                   2.7              2.7 (+0.8%)              2.9 (+10.2%)
+  GPT-OSS 120B
+                               GSM-8K                     3.3              3.2 (−2.7%)              3.5 (+5.2%)
+                               Average                    3.1              3.0 (−3.2%)              3.3 (+4.5%)
+                               HumanEval                 3.7               3.3 (−11.1%)             3.8 (+2.4%)
+                               MT-Bench                  3.4               2.9 (−13.8%)             3.4 (+1.5%)
+  GPT-OSS 20B
+                               GSM-8K                    3.9               3.5 (−10.3%)             4.0 (+3.1%)
+                               Average                   3.7               3.2 (−12.4%)             3.7 (+2.5%)
+                               HumanEval                  4.4              4.2 (−5.0%)              4.5 (+3.7%)
+                               MT-Bench                   3.0              2.8 (−6.3%)              3.0 (+0.3%)
+  Qwen3-Coder 30B
+                               GSM-8K                     3.1              2.8 (−10%)               3.2 (+1.0%)
+                               Average                    3.5              3.3 (−6.9%)              3.6 (+2.0%)
+
+Key observations: (1) 2-layer P-EAGLE achieves 93–97% of the baseline acceptance length on average, while 4-layer
+matches or exceeds it. (2) The gap is most pronounced on GPT-OSS 20B, where 2-layer shows −12.4% average degradation
+while 4-layer achieves +2.5% improvement. (3) For deployment scenarios prioritizing lower drafting latency over acceptance
+length, 2-layer P-EAGLE remains a viable option.
+
+
+
+
+                                                           13
+

@@ -1,0 +1,14 @@
+{
+  "userIgnoreFilters": [
+    "AGENTS.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "attachmentFolderPath": "raw/assets",
+  "newFileLocation": "folder",
+  "newFileFolderPath": "wiki",
+  "useMarkdownLinks": false,
+  "newLinkFormat": "shortest",
+  "showUnsupportedFiles": true,
+  "alwaysUpdateLinks": true
+}
